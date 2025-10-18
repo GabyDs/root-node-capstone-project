@@ -15,236 +15,299 @@
 #include "mdf_common.h"
 #include "mwifi.h"
 #include "driver/uart.h"
-#include "cJSON.h"
+
+static const char *TAG = "root_node";
+
+#define DATA_BUFFER_SIZE 65536 // 64KB buffer for ESP-CAM image data
+
+// Structure to hold received data for storage task
+typedef struct {
+    uint8_t src_addr[MWIFI_ADDR_LEN];
+    uint8_t *data;
+    size_t size;
+    mwifi_data_type_t data_type;
+} received_data_t;
+
+// HTTP server configuration
+#define HTTP_SERVER_URL "http://fabcontigiani.uno:8000/upload/"  // Change this to your server
+#define HTTP_TIMEOUT_MS 10000
+
+// Queue and task handle for HTTP operations
+static QueueHandle_t http_queue = NULL;
+static TaskHandle_t http_task_handle = NULL;
+
+#define HTTP_QUEUE_SIZE 10
+
+/**
+ * @brief Task to handle HTTP POST of received data
+ */
+static void http_post_task(void *arg)
+{
+    ESP_LOGI(TAG, "HTTP POST task started");
+    received_data_t received_item;
+    
+    for (;;)
+    {
+        // Wait for data to be queued
+        if (xQueueReceive(http_queue, &received_item, portMAX_DELAY) == pdTRUE)
+        {
+            ESP_LOGI(TAG, "Processing received data from: " MACSTR " (%d bytes)", 
+                     MAC2STR(received_item.src_addr), received_item.size);
+            
+            // Validate received data
+            if (received_item.data == NULL || received_item.size == 0) {
+                ESP_LOGW(TAG, "Invalid received data, skipping HTTP POST");
+                if (received_item.data != NULL) {
+                    MDF_FREE(received_item.data);
+                }
+                continue;
+            }
+            
+            // Generate filename for the upload
+            char filename[64];
+            snprintf(filename, sizeof(filename), 
+                     "received_%02x%02x%02x%02x%02x%02x_%lu.jpg", 
+                     received_item.src_addr[0], received_item.src_addr[1], 
+                     received_item.src_addr[2], received_item.src_addr[3], 
+                     received_item.src_addr[4], received_item.src_addr[5], 
+                     (unsigned long)(esp_timer_get_time() / 1000));
+            
+            ESP_LOGI(TAG, "Sending received data via HTTP POST: %s (%d bytes)", filename, received_item.size);
+            ESP_LOGI(TAG, "HTTP Server URL: %s", HTTP_SERVER_URL);
+            
+            // Try using esp_http_client_perform with pre-built data
+            // Create the complete multipart body in memory first
+            char boundary[] = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+            
+            char form_start[512];
+            char form_end[128];
+            
+            snprintf(form_start, sizeof(form_start),
+                "--%s\r\n"
+                "Content-Disposition: form-data; name=\"image\"; filename=\"%s\"\r\n"
+                "Content-Type: image/jpeg\r\n\r\n", 
+                boundary, filename);
+            snprintf(form_end, sizeof(form_end), "\r\n--%s--\r\n", boundary);
+            
+            int start_len = strlen(form_start);
+            int end_len = strlen(form_end);
+            int total_body_len = start_len + received_item.size + end_len;
+            
+            // Allocate memory for complete body in heap
+            uint8_t *complete_body = MDF_MALLOC(total_body_len);
+            if (complete_body == NULL) {
+                ESP_LOGE(TAG, "Failed to allocate memory for HTTP body (%d bytes)", total_body_len);
+                ESP_LOGE(TAG, "Free heap: %u bytes, largest free block: %u bytes", 
+                         esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+                MDF_FREE(received_item.data);
+                continue;
+            }
+            
+            // Build complete multipart body
+            memcpy(complete_body, form_start, start_len);
+            memcpy(complete_body + start_len, received_item.data, received_item.size);
+            memcpy(complete_body + start_len + received_item.size, form_end, end_len);
+            
+            ESP_LOGI(TAG, "Built complete multipart body: %d bytes", total_body_len);
+            ESP_LOGI(TAG, "Form structure preview: %.100s", (char*)complete_body);
+            
+            // Configure HTTP client with complete body
+            esp_http_client_config_t config = {
+                .url = HTTP_SERVER_URL,
+                .method = HTTP_METHOD_POST,
+                .timeout_ms = HTTP_TIMEOUT_MS,
+                .max_redirection_count = 5,
+                .disable_auto_redirect = false,
+            };
+            
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+            if (client == NULL) {
+                ESP_LOGE(TAG, "Failed to initialize HTTP client");
+                MDF_FREE(received_item.data);
+                MDF_FREE(complete_body);
+                continue;
+            }
+            
+            // Set content type header
+            char content_type[128];
+            snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+            esp_http_client_set_header(client, "Content-Type", content_type);
+            
+            // Set the complete body
+            esp_http_client_set_post_field(client, (char*)complete_body, total_body_len);
+            
+            // Perform the request
+            esp_err_t err = esp_http_client_perform(client);
+            
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "HTTP request completed successfully");
+            } else {
+                ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+            }
+            
+            // Get response details
+            int status_code = esp_http_client_get_status_code(client);
+            int content_length = esp_http_client_get_content_length(client);
+            
+            ESP_LOGI(TAG, "HTTP POST completed - Status: %d, Content-Length: %d", status_code, content_length);
+            
+            if (status_code >= 200 && status_code < 300) {
+                ESP_LOGI(TAG, "Successfully uploaded image: %s", filename);
+            } else if (status_code >= 300 && status_code < 400) {
+                // Handle redirect responses
+                ESP_LOGW(TAG, "HTTP redirect response: %d", status_code);
+                
+                // Get the Location header for debugging
+                // char location_buffer[256];
+                // int location_len = esp_http_client_get_header(client, "Location", location_buffer, sizeof(location_buffer) - 1);
+                // if (location_len > 0) {
+                //     location_buffer[location_len] = '\0';
+                //     ESP_LOGW(TAG, "Redirect location: %s", location_buffer);
+                // }
+                
+                ESP_LOGE(TAG, "HTTP upload failed due to redirect: %d", status_code);
+            } else {
+                ESP_LOGE(TAG, "HTTP upload failed with status: %d", status_code);
+                
+                // Read error response if available
+                if (content_length > 0 && content_length < 1024) {
+                    char response_buffer[1024];
+                    int read_len = esp_http_client_read_response(client, response_buffer, sizeof(response_buffer) - 1);
+                    if (read_len > 0) {
+                        response_buffer[read_len] = '\0';
+                        ESP_LOGE(TAG, "Server response: %s", response_buffer);
+                    }
+                }
+            }
+            
+            // Cleanup
+            esp_http_client_cleanup(client);
+            MDF_FREE(complete_body);
+            MDF_FREE(received_item.data);
+        }
+    }
+    
+    vTaskDelete(NULL);
+}
 
 // #define MEMORY_DEBUG
 
+#define EXAMPLE_MAX_CHAR_SIZE 64
+
 #define BUF_SIZE (1024)
 
-static int g_sockfd    = -1;
-static const char *TAG = "root_node";
 static esp_netif_t *netif_sta = NULL;
 
-/**
- * @brief Create a tcp client
- */
-static int socket_tcp_client_create(const char *ip, uint16_t port)
-{
-    MDF_PARAM_CHECK(ip);
-
-    MDF_LOGI("Create a tcp client, ip: %s, port: %d", ip, port);
-
-    mdf_err_t ret = ESP_OK;
-    int sockfd    = -1;
-    struct sockaddr_in server_addr = {
-        .sin_family = AF_INET,
-        .sin_port = htons(port),
-        .sin_addr.s_addr = inet_addr(ip),
-    };
-
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    MDF_ERROR_GOTO(sockfd < 0, ERR_EXIT, "socket create, sockfd: %d", sockfd);
-
-    ret = connect(sockfd, (struct sockaddr *)&server_addr, sizeof(struct sockaddr_in));
-    MDF_ERROR_GOTO(ret < 0, ERR_EXIT, "socket connect, ret: %d, ip: %s, port: %d",
-                   ret, ip, port);
-    return sockfd;
-
-ERR_EXIT:
-
-    if (sockfd != -1) {
-        close(sockfd);
-    }
-
-    return -1;
-}
-
-void tcp_client_read_task(void *arg)
-{
-    mdf_err_t ret                     = MDF_OK;
-    char *data                        = MDF_MALLOC(MWIFI_PAYLOAD_LEN);
-    size_t size                       = MWIFI_PAYLOAD_LEN;
-    uint8_t dest_addr[MWIFI_ADDR_LEN] = {0x0};
-    mwifi_data_type_t data_type       = {0x0};
-    cJSON *json_root                  = NULL;
-    cJSON *json_addr                  = NULL;
-    cJSON *json_group                 = NULL;
-    cJSON *json_data                  = NULL;
-    cJSON *json_dest_addr             = NULL;
-
-    MDF_LOGI("TCP client read task is running");
-
-    while (mwifi_is_connected()) {
-        if (g_sockfd == -1) {
-            g_sockfd = socket_tcp_client_create(CONFIG_SERVER_IP, CONFIG_SERVER_PORT);
-
-            if (g_sockfd == -1) {
-                vTaskDelay(500 / portTICK_PERIOD_MS);
-                continue;
-            }
-        }
-
-        memset(data, 0, MWIFI_PAYLOAD_LEN);
-        ret = read(g_sockfd, data, size);
-        MDF_LOGD("TCP read, %d, size: %d, data: %s", g_sockfd, size, data);
-
-        if (ret <= 0) {
-            MDF_LOGW("<%s> TCP read", strerror(errno));
-            close(g_sockfd);
-            g_sockfd = -1;
-            continue;
-        }
-
-        json_root = cJSON_Parse(data);
-        MDF_ERROR_CONTINUE(!json_root, "cJSON_Parse, data format error");
-
-        /**
-         * @brief Check if it is a group address. If it is a group address, data_type.group = true.
-         */
-        json_addr = cJSON_GetObjectItem(json_root, "dest_addr");
-        json_group = cJSON_GetObjectItem(json_root, "group");
-
-        if (json_addr) {
-            data_type.group = false;
-            json_dest_addr = json_addr;
-        } else if (json_group) {
-            data_type.group = true;
-            json_dest_addr = json_group;
-        } else {
-            MDF_LOGW("Address not found");
-            cJSON_Delete(json_root);
-            continue;
-        }
-
-        /**
-         * @brief  Convert mac from string format to binary
-         */
-        do {
-            unsigned int mac_data[MWIFI_ADDR_LEN] = {0};
-            sscanf(json_dest_addr->valuestring, MACSTR,
-                   mac_data, mac_data + 1, mac_data + 2,
-                   mac_data + 3, mac_data + 4, mac_data + 5);
-
-            for (int i = 0; i < MWIFI_ADDR_LEN; i++) {
-                dest_addr[i] = mac_data[i];
-            }
-        } while (0);
-
-        json_data = cJSON_GetObjectItem(json_root, "data");
-        char *send_data = cJSON_PrintUnformatted(json_data);
-
-        ret = mwifi_write(dest_addr, &data_type, send_data, strlen(send_data), true);
-        MDF_ERROR_GOTO(ret != MDF_OK, FREE_MEM, "<%s> mwifi_root_write", mdf_err_to_name(ret));
-
-FREE_MEM:
-        MDF_FREE(send_data);
-        cJSON_Delete(json_root);
-    }
-
-    MDF_LOGI("TCP client read task is exit");
-
-    close(g_sockfd);
-    g_sockfd = -1;
-    MDF_FREE(data);
-    vTaskDelete(NULL);
-}
-
-void tcp_client_write_task(void *arg)
+static void root_task(void *arg)
 {
     mdf_err_t ret = MDF_OK;
-    char *data    = MDF_CALLOC(1, MWIFI_PAYLOAD_LEN);
-    size_t size   = MWIFI_PAYLOAD_LEN;
+    // Use 64KB buffer to handle larger image chunks or accumulated data
+    size_t buffer_capacity = DATA_BUFFER_SIZE;
+    uint8_t *data = MDF_CALLOC(1, buffer_capacity);
+    if (data == NULL) {
+        ESP_LOGW(TAG, "Failed to allocate %d-byte data buffer, trying MWIFI payload size", DATA_BUFFER_SIZE);
+        buffer_capacity = MWIFI_PAYLOAD_LEN;
+        data = MDF_CALLOC(1, buffer_capacity);
+        if (data == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate data buffer (%zu bytes)", buffer_capacity);
+            ESP_LOGE(TAG, "Free heap: %u bytes, largest free block: %u bytes", 
+                     esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    size_t size = buffer_capacity;
+
     uint8_t src_addr[MWIFI_ADDR_LEN] = {0x0};
-    mwifi_data_type_t data_type      = {0x0};
+    mwifi_data_type_t data_type = {0};
 
-    MDF_LOGI("TCP client write task is running");
+    MDF_LOGI("Root task is running");
 
-    while (mwifi_is_connected()) {
-        if (g_sockfd == -1) {
+    // Wait until node is actually root before attempting to read
+    while (!esp_mesh_is_root()) {
+        ESP_LOGI(TAG, "Waiting to become root node...");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+        
+        if (!mwifi_is_started()) {
+            ESP_LOGW(TAG, "Mesh not started, waiting...");
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+    }
+    
+    ESP_LOGI(TAG, "Node is now root, starting to read data");
+
+    for (;;)
+    {
+        if (!mwifi_is_started())
+        {
             vTaskDelay(500 / portTICK_PERIOD_MS);
             continue;
         }
 
-        size = MWIFI_PAYLOAD_LEN - 1;
-        memset(data, 0, MWIFI_PAYLOAD_LEN);
+        // Double-check we're still root before attempting read
+        if (!esp_mesh_is_root()) {
+            ESP_LOGW(TAG, "Node is no longer root, waiting to become root again...");
+            while (!esp_mesh_is_root()) {
+                vTaskDelay(1000 / portTICK_PERIOD_MS);
+                if (!mwifi_is_started()) {
+                    break;
+                }
+            }
+            ESP_LOGI(TAG, "Node is root again, resuming data reading");
+            continue;
+        }
+
+    size = buffer_capacity;
+    memset(data, 0, buffer_capacity);
         ret = mwifi_root_read(src_addr, &data_type, data, &size, portMAX_DELAY);
         MDF_ERROR_CONTINUE(ret != MDF_OK, "<%s> mwifi_root_read", mdf_err_to_name(ret));
+        MDF_LOGI("Root receive, addr: " MACSTR ", size: %d", MAC2STR(src_addr), size);
 
-        MDF_LOGD("TCP write, size: %d, data: %s", size, data);
-        ret = write(g_sockfd, data, size);
-        MDF_ERROR_CONTINUE(ret <= 0, "<%s> TCP write", strerror(errno));
-    }
-
-    MDF_LOGI("TCP client write task is exit");
-
-    close(g_sockfd);
-    g_sockfd = -1;
-    MDF_FREE(data);
-    vTaskDelete(NULL);
-}
-
-static void node_read_task(void *arg)
-{
-    mdf_err_t ret                    = MDF_OK;
-    char *data                       = MDF_MALLOC(MWIFI_PAYLOAD_LEN);
-    size_t size                      = MWIFI_PAYLOAD_LEN;
-    mwifi_data_type_t data_type      = {0x0};
-    uint8_t src_addr[MWIFI_ADDR_LEN] = {0x0};
-
-    MDF_LOGI("Note read task is running");
-
-    for (;;) {
-        if (!mwifi_is_connected()) {
-            vTaskDelay(500 / portTICK_PERIOD_MS);
+        // Validate received data size
+        if (size == 0) {
+            ESP_LOGW(TAG, "Received empty data, skipping save");
             continue;
         }
 
-        size = MWIFI_PAYLOAD_LEN;
-        memset(data, 0, MWIFI_PAYLOAD_LEN);
-        ret = mwifi_read(src_addr, &data_type, data, &size, portMAX_DELAY);
-        MDF_ERROR_CONTINUE(ret != MDF_OK, "<%s> mwifi_read", mdf_err_to_name(ret));
-        MDF_LOGD("Node receive: " MACSTR ", size: %d, data: %s", MAC2STR(src_addr), size, data);
-    }
-
-    MDF_LOGW("Note read task is exit");
-
-    MDF_FREE(data);
-    vTaskDelete(NULL);
-}
-
-static void node_write_task(void *arg)
-{
-    size_t size                     = 0;
-    int count                       = 0;
-    char *data                      = NULL;
-    mdf_err_t ret                   = MDF_OK;
-    mwifi_data_type_t data_type     = {0};
-    uint8_t sta_mac[MWIFI_ADDR_LEN] = {0};
-
-    MDF_LOGI("NODE task is running");
-
-    esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
-
-    for (;;) {
-        if (!mwifi_is_connected()) {
-            vTaskDelay(500 / portTICK_PERIOD_MS);
+        // Prepare data for storage task
+        received_data_t received_item;
+        memcpy(received_item.src_addr, src_addr, MWIFI_ADDR_LEN);
+        received_item.data_type = data_type;
+        received_item.size = size;
+        
+        // Allocate memory for the data copy in internal memory (for large image data)
+        received_item.data = MDF_MALLOC(size);
+        if (received_item.data == NULL) {
+            ESP_LOGE(TAG, "Failed to allocate memory for received data (%zu bytes)", size);
+            ESP_LOGE(TAG, "Free heap: %u bytes, largest free block: %u bytes", 
+                     esp_get_free_heap_size(), heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
             continue;
         }
+        memcpy(received_item.data, data, size);
+        
+        // Queue the data for HTTP POST task
+        if (http_queue != NULL) {
+            if (xQueueSend(http_queue, &received_item, pdMS_TO_TICKS(1000)) != pdTRUE) {
+                ESP_LOGE(TAG, "Failed to queue received data for HTTP POST (queue full?)");
+                MDF_FREE(received_item.data); // Free memory if queueing failed
+            } else {
+                ESP_LOGI(TAG, "Queued received data for HTTP POST");
+            }
+        } else {
+            ESP_LOGE(TAG, "HTTP queue not initialized");
+            MDF_FREE(received_item.data);
+        }
 
-        size = asprintf(&data, "{\"src_addr\": \"" MACSTR "\",\"data\": \"Hello TCP Server!\",\"count\": %d}",
-                        MAC2STR(sta_mac), count++);
-
-        MDF_LOGD("Node send, size: %d, data: %s", size, data);
-        ret = mwifi_write(NULL, &data_type, data, size, true);
-        MDF_FREE(data);
-        MDF_ERROR_CONTINUE(ret != MDF_OK, "<%s> mwifi_write", mdf_err_to_name(ret));
-
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        // size = sprintf(data, "(%d) Hello node!", i);
+        // ret = mwifi_root_write(src_addr, 1, &data_type, data, size, true);
+        // MDF_ERROR_CONTINUE(ret != MDF_OK, "mwifi_root_recv, ret: %x", ret);
+        // MDF_LOGI("Root send, addr: " MACSTR ", size: %d, data: %s", MAC2STR(src_addr), size, data);
     }
 
-    MDF_FREE(data);
-    MDF_LOGW("NODE task is exit");
+    MDF_LOGW("Root is exit");
 
+    MDF_FREE(data);
     vTaskDelete(NULL);
 }
 
@@ -253,11 +316,11 @@ static void node_write_task(void *arg)
  */
 static void print_system_info_timercb(TimerHandle_t timer)
 {
-    uint8_t primary                 = 0;
-    wifi_second_chan_t second       = 0;
-    mesh_addr_t parent_bssid        = {0};
+    uint8_t primary = 0;
+    wifi_second_chan_t second = 0;
+    mesh_addr_t parent_bssid = {0};
     uint8_t sta_mac[MWIFI_ADDR_LEN] = {0};
-    wifi_sta_list_t wifi_sta_list   = {0x0};
+    wifi_sta_list_t wifi_sta_list = {0x0};
 
     esp_wifi_get_mac(ESP_IF_WIFI_STA, sta_mac);
     esp_wifi_ap_get_sta_list(&wifi_sta_list);
@@ -265,17 +328,20 @@ static void print_system_info_timercb(TimerHandle_t timer)
     esp_mesh_get_parent_bssid(&parent_bssid);
 
     MDF_LOGI("System information, channel: %d, layer: %d, self mac: " MACSTR ", parent bssid: " MACSTR
-             ", parent rssi: %d, node num: %d, free heap: %"PRIu32, primary,
+             ", parent rssi: %d, node num: %d, free heap: %" PRIu32,
+             primary,
              esp_mesh_get_layer(), MAC2STR(sta_mac), MAC2STR(parent_bssid.addr),
              mwifi_get_parent_rssi(), esp_mesh_get_total_node_num(), esp_get_free_heap_size());
 
-    for (int i = 0; i < wifi_sta_list.num; i++) {
+    for (int i = 0; i < wifi_sta_list.num; i++)
+    {
         MDF_LOGI("Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
     }
 
 #ifdef MEMORY_DEBUG
 
-    if (!heap_caps_check_integrity_all(true)) {
+    if (!heap_caps_check_integrity_all(true))
+    {
         MDF_LOGE("At least one heap is corrupt");
     }
 
@@ -287,10 +353,11 @@ static void print_system_info_timercb(TimerHandle_t timer)
 
 static mdf_err_t wifi_init()
 {
-    mdf_err_t ret          = nvs_flash_init();
+    mdf_err_t ret = nvs_flash_init();
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         MDF_ERROR_ASSERT(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -320,42 +387,41 @@ static mdf_err_t wifi_init()
  */
 static mdf_err_t event_loop_cb(mdf_event_loop_t event, void *ctx)
 {
-    MDF_LOGI("event_loop_cb, event: %"PRIu32, event);
+    MDF_LOGI("event_loop_cb, event: %" PRIu32, event);
 
-    switch (event) {
-        case MDF_EVENT_MWIFI_STARTED:
-            MDF_LOGI("MESH is started");
-            break;
+    switch (event)
+    {
+    case MDF_EVENT_MWIFI_STARTED:
+        MDF_LOGI("MESH is started");
+        break;
 
-        case MDF_EVENT_MWIFI_PARENT_CONNECTED:
-            MDF_LOGI("Parent is connected on station interface");
+    case MDF_EVENT_MWIFI_PARENT_CONNECTED:
+        MDF_LOGI("Parent is connected on station interface");
 
-            if (esp_mesh_is_root()) {
-                esp_netif_dhcpc_start(netif_sta);
-            }
-
-            break;
-
-        case MDF_EVENT_MWIFI_PARENT_DISCONNECTED:
-            MDF_LOGI("Parent is disconnected on station interface");
-            break;
-
-        case MDF_EVENT_MWIFI_ROUTING_TABLE_ADD:
-        case MDF_EVENT_MWIFI_ROUTING_TABLE_REMOVE:
-            MDF_LOGI("total_num: %d", esp_mesh_get_total_node_num());
-            break;
-
-        case MDF_EVENT_MWIFI_ROOT_GOT_IP: {
-            MDF_LOGI("Root obtains the IP address. It is posted by LwIP stack automatically");
-            xTaskCreate(tcp_client_write_task, "tcp_client_write_task", 4 * 1024,
-                        NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-            xTaskCreate(tcp_client_read_task, "tcp_server_read", 4 * 1024,
-                        NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-            break;
+        if (esp_mesh_is_root())
+        {
+            esp_netif_dhcpc_start(netif_sta);
         }
 
-        default:
-            break;
+        break;
+
+    case MDF_EVENT_MWIFI_PARENT_DISCONNECTED:
+        MDF_LOGI("Parent is disconnected on station interface");
+        break;
+
+    case MDF_EVENT_MWIFI_ROUTING_TABLE_ADD:
+    case MDF_EVENT_MWIFI_ROUTING_TABLE_REMOVE:
+        MDF_LOGI("total_num: %d", esp_mesh_get_total_node_num());
+        break;
+
+    case MDF_EVENT_MWIFI_ROOT_GOT_IP:
+    {
+        MDF_LOGI("Root obtains the IP address. It is posted by LwIP stack automatically");
+        break;
+    }
+
+    default:
+        break;
     }
 
     return MDF_OK;
@@ -363,12 +429,12 @@ static mdf_err_t event_loop_cb(mdf_event_loop_t event, void *ctx)
 
 void app_main()
 {
-    mwifi_init_config_t cfg   = MWIFI_INIT_CONFIG_DEFAULT();
-    mwifi_config_t config     = {
-        .router_ssid     = CONFIG_ROUTER_SSID,
+    mwifi_init_config_t cfg = MWIFI_INIT_CONFIG_DEFAULT();
+    mwifi_config_t config = {
+        .router_ssid = CONFIG_ROUTER_SSID,
         .router_password = CONFIG_ROUTER_PASSWORD,
-        .mesh_id         = CONFIG_MESH_ID,
-        .mesh_password   = CONFIG_MESH_PASSWORD,
+        .mesh_id = CONFIG_MESH_ID,
+        .mesh_password = CONFIG_MESH_PASSWORD,
     };
 
     /**
@@ -391,20 +457,35 @@ void app_main()
      *      group id can be a custom address
      */
     const uint8_t group_id_list[2][6] = {{0x01, 0x00, 0x5e, 0xae, 0xae, 0xae},
-                                        {0x01, 0x00, 0x5e, 0xae, 0xae, 0xaf}};
+                                         {0x01, 0x00, 0x5e, 0xae, 0xae, 0xaf}};
 
     MDF_ERROR_ASSERT(esp_mesh_set_group_id((mesh_addr_t *)group_id_list,
                                            sizeof(group_id_list) / sizeof(group_id_list[0])));
 
-    /**
-     * @breif Create handler
-     */
-    xTaskCreate(node_write_task, "node_write_task", 4 * 1024,
-                NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
-    xTaskCreate(node_read_task, "node_read_task", 4 * 1024,
-                NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+    ESP_LOGI(TAG, "Mesh initialization complete. Waiting for root to get IP...");
 
     TimerHandle_t timer = xTimerCreate("print_system_info", 10000 / portTICK_PERIOD_MS,
                                        true, NULL, print_system_info_timercb);
     xTimerStart(timer, 0);
+
+    // Create HTTP queue and task
+    ESP_LOGI(TAG, "Creating HTTP queue and task...");
+    http_queue = xQueueCreate(HTTP_QUEUE_SIZE, sizeof(received_data_t));
+    if (http_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create HTTP queue");
+        return;
+    }
+
+    BaseType_t http_task = xTaskCreate(http_post_task, "http_post_task", 12288, NULL, 4, &http_task_handle);
+    if (http_task != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create HTTP POST task");
+        vQueueDelete(http_queue);
+        return;
+    }
+    ESP_LOGI(TAG, "HTTP queue and task created successfully");
+
+    MDF_LOGI("Creating root task...");
+    xTaskCreate(root_task, "root_task", 4 * 1024,
+                NULL, CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
 }
