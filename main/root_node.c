@@ -451,6 +451,7 @@ void app_main()
     MDF_ERROR_ASSERT(wifi_init());
     MDF_ERROR_ASSERT(mwifi_init(&cfg));
     MDF_ERROR_ASSERT(mwifi_set_config(&config));
+    MDF_ERROR_ASSERT(esp_mesh_fix_root(true));
     MDF_ERROR_ASSERT(mwifi_start());
 
     /**
