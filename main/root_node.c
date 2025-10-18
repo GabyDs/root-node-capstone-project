@@ -435,6 +435,7 @@ void app_main()
         .router_password = CONFIG_ROUTER_PASSWORD,
         .mesh_id = CONFIG_MESH_ID,
         .mesh_password = CONFIG_MESH_PASSWORD,
+        .mesh_type = MWIFI_MESH_ROOT,
     };
 
     /**
