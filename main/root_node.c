@@ -29,7 +29,7 @@ typedef struct {
 } received_data_t;
 
 // HTTP server configuration
-#define HTTP_SERVER_URL "http://fabcontigiani.uno:8000/upload/"  // Change this to your server
+#define HTTP_SERVER_URL "http://fabcontigiani.uno/upload/"  // Change this to your server
 #define HTTP_TIMEOUT_MS 10000
 
 // Queue and task handle for HTTP operations
@@ -75,6 +75,10 @@ static void http_post_task(void *arg)
             ESP_LOGI(TAG, "Sending received data via HTTP POST: %s (%d bytes)", filename, received_item.size);
             ESP_LOGI(TAG, "HTTP Server URL: %s", HTTP_SERVER_URL);
             
+            // Get MAC address of this device (root node)
+            uint8_t root_mac[6];
+            esp_wifi_get_mac(ESP_IF_WIFI_STA, root_mac);
+            
             // Try using esp_http_client_perform with pre-built data
             // Create the complete multipart body in memory first
             char boundary[] = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
@@ -84,11 +88,17 @@ static void http_post_task(void *arg)
             
             snprintf(form_start, sizeof(form_start),
                 "--%s\r\n"
+                "Content-Disposition: form-data; name=\"mac_address\"\r\n\r\n"
+                "%02x:%02x:%02x:%02x:%02x:%02x\r\n"
+                "--%s\r\n"
                 "Content-Disposition: form-data; name=\"image\"; filename=\"%s\"\r\n"
                 "Content-Type: image/jpeg\r\n\r\n", 
+                boundary,
+                root_mac[0], root_mac[1], root_mac[2],
+                root_mac[3], root_mac[4], root_mac[5],
                 boundary, filename);
             snprintf(form_end, sizeof(form_end), "\r\n--%s--\r\n", boundary);
-            
+
             int start_len = strlen(form_start);
             int end_len = strlen(form_end);
             int total_body_len = start_len + received_item.size + end_len;
