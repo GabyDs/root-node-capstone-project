@@ -18,7 +18,7 @@
 
 static const char *TAG = "root_node";
 
-#define DATA_BUFFER_SIZE 65536 // 64KB buffer for ESP-CAM image data
+#define DATA_BUFFER_SIZE 45056 // 44KB buffer for ESP-CAM image data
 
 // Let's Encrypt ISRG Root X1 certificate (valid until 2035)
 static const char *letsencrypt_root_ca =
@@ -78,17 +78,13 @@ typedef struct {
 static QueueHandle_t http_queue = NULL;
 static TaskHandle_t http_task_handle = NULL;
 
-#define HTTP_QUEUE_SIZE 10
+#define HTTP_QUEUE_SIZE 4
 
-/**
- * @brief Task to handle HTTP POST of received data
- */
-static void http_post_task(void *arg) {
-  ESP_LOGI(TAG, "HTTP POST task started");
+// Eliminar la construcción del body completo y usar chunked transfer
+static void http_post_task_streaming(void *arg) {
   received_data_t received_item;
 
   for (;;) {
-    // Wait for data to be queued
     if (xQueueReceive(http_queue, &received_item, portMAX_DELAY) == pdTRUE) {
       ESP_LOGI(TAG, "Processing received data from: " MACSTR " (%d bytes)",
                MAC2STR(received_item.src_addr), received_item.size);
@@ -102,151 +98,63 @@ static void http_post_task(void *arg) {
         continue;
       }
 
-      // Generate filename for the upload
+      char boundary[] = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
+      char form_start[512];
+      char form_end[64];
+
+      // Generar filename...
       char filename[64];
-      snprintf(filename, sizeof(filename),
-               "received_%02x%02x%02x%02x%02x%02x_%lu.jpg",
+      snprintf(filename, sizeof(filename), "img_%02x%02x%02x%02x%02x%02x_%lu.jpg",
                received_item.src_addr[0], received_item.src_addr[1],
                received_item.src_addr[2], received_item.src_addr[3],
                received_item.src_addr[4], received_item.src_addr[5],
                (unsigned long)(esp_timer_get_time() / 1000));
 
-      ESP_LOGI(TAG, "Sending received data via HTTP POST: %s (%d bytes)",
-               filename, received_item.size);
-      ESP_LOGI(TAG, "HTTP Server URL: %s", HTTP_SERVER_URL);
-
-      // Get MAC address of this device (root node) - commented out, not needed by Django server
-      // uint8_t root_mac[6];
-      // esp_wifi_get_mac(ESP_IF_WIFI_STA, root_mac);
-
-      // Try using esp_http_client_perform with pre-built data
-      // Create the complete multipart body in memory first
-      char boundary[] = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
-
-      char form_start[512];
-      char form_end[128];
-
-      // Django server only expects 'image' field
-      snprintf(
-          form_start, sizeof(form_start),
+      snprintf(form_start, sizeof(form_start),
           "--%s\r\n"
           "Content-Disposition: form-data; name=\"image\"; filename=\"%s\"\r\n"
           "Content-Type: image/jpeg\r\n\r\n",
           boundary, filename);
       snprintf(form_end, sizeof(form_end), "\r\n--%s--\r\n", boundary);
 
-      int start_len = strlen(form_start);
-      int end_len = strlen(form_end);
-      int total_body_len = start_len + received_item.size + end_len;
+      int content_length = strlen(form_start) + received_item.size + strlen(form_end);
 
-      // Allocate memory for complete body in heap
-      uint8_t *complete_body = MDF_MALLOC(total_body_len);
-      if (complete_body == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate memory for HTTP body (%d bytes)",
-                 total_body_len);
-        ESP_LOGE(TAG, "Free heap: %u bytes, largest free block: %u bytes",
-                 esp_get_free_heap_size(),
-                 heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-        MDF_FREE(received_item.data);
-        continue;
-      }
-
-      // Build complete multipart body
-      memcpy(complete_body, form_start, start_len);
-      memcpy(complete_body + start_len, received_item.data, received_item.size);
-      memcpy(complete_body + start_len + received_item.size, form_end, end_len);
-
-      ESP_LOGI(TAG, "Built complete multipart body: %d bytes", total_body_len);
-      ESP_LOGI(TAG, "Form structure preview: %.100s", (char *)complete_body);
-
-      // Configure HTTP client with complete body
       esp_http_client_config_t config = {
           .url = HTTP_SERVER_URL,
           .method = HTTP_METHOD_POST,
           .timeout_ms = HTTP_TIMEOUT_MS,
-          .max_redirection_count = 5,
-          .disable_auto_redirect = false,
 #if USE_HTTPS
           .cert_pem = letsencrypt_root_ca,
 #endif
       };
 
       esp_http_client_handle_t client = esp_http_client_init(&config);
-      if (client == NULL) {
-        ESP_LOGE(TAG, "Failed to initialize HTTP client");
-        MDF_FREE(received_item.data);
-        MDF_FREE(complete_body);
-        continue;
-      }
 
-      // Set content type header
       char content_type[128];
       snprintf(content_type, sizeof(content_type),
                "multipart/form-data; boundary=%s", boundary);
       esp_http_client_set_header(client, "Content-Type", content_type);
 
-      // Set the complete body
-      esp_http_client_set_post_field(client, (char *)complete_body,
-                                     total_body_len);
-
-      // Perform the request
-      esp_err_t err = esp_http_client_perform(client);
-
+      // Abrir conexión con Content-Length conocido
+      esp_err_t err = esp_http_client_open(client, content_length);
       if (err == ESP_OK) {
-        ESP_LOGI(TAG, "HTTP request completed successfully");
-      } else {
-        ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
+        // Enviar en partes - NO se duplica memoria
+        esp_http_client_write(client, form_start, strlen(form_start));
+        esp_http_client_write(client, (char*)received_item.data, received_item.size);
+        esp_http_client_write(client, form_end, strlen(form_end));
+
+        // Obtener respuesta
+        esp_http_client_fetch_headers(client);
+        int status = esp_http_client_get_status_code(client);
+        ESP_LOGI(TAG, "HTTP POST status: %d", status);
       }
 
-      // Get response details
-      int status_code = esp_http_client_get_status_code(client);
-      int content_length = esp_http_client_get_content_length(client);
-
-      ESP_LOGI(TAG, "HTTP POST completed - Status: %d, Content-Length: %d",
-               status_code, content_length);
-
-      if (status_code >= 200 && status_code < 300) {
-        ESP_LOGI(TAG, "Successfully uploaded image: %s", filename);
-      } else if (status_code >= 300 && status_code < 400) {
-        // Handle redirect responses
-        ESP_LOGW(TAG, "HTTP redirect response: %d", status_code);
-
-        // Get the Location header for debugging
-        // char location_buffer[256];
-        // int location_len = esp_http_client_get_header(client, "Location",
-        // location_buffer, sizeof(location_buffer) - 1); if (location_len > 0)
-        // {
-        //     location_buffer[location_len] = '\0';
-        //     ESP_LOGW(TAG, "Redirect location: %s", location_buffer);
-        // }
-
-        ESP_LOGE(TAG, "HTTP upload failed due to redirect: %d", status_code);
-      } else {
-        ESP_LOGE(TAG, "HTTP upload failed with status: %d", status_code);
-
-        // Read error response if available
-        if (content_length > 0 && content_length < 1024) {
-          char response_buffer[1024];
-          int read_len = esp_http_client_read_response(
-              client, response_buffer, sizeof(response_buffer) - 1);
-          if (read_len > 0) {
-            response_buffer[read_len] = '\0';
-            ESP_LOGE(TAG, "Server response: %s", response_buffer);
-          }
-        }
-      }
-
-      // Cleanup
+      esp_http_client_close(client);
       esp_http_client_cleanup(client);
-      MDF_FREE(complete_body);
       MDF_FREE(received_item.data);
     }
   }
-
-  vTaskDelete(NULL);
 }
-
-// #define MEMORY_DEBUG
 
 #define EXAMPLE_MAX_CHAR_SIZE 64
 
@@ -548,7 +456,8 @@ void app_main() {
     return;
   }
 
-  BaseType_t http_task = xTaskCreate(http_post_task, "http_post_task", 12288,
+  // Usar streaming para menor uso de memoria
+  BaseType_t http_task = xTaskCreate(http_post_task_streaming, "http_post_task", 8192,
                                      NULL, 4, &http_task_handle);
   if (http_task != pdPASS) {
     ESP_LOGE(TAG, "Failed to create HTTP POST task");
